@@ -70,6 +70,16 @@ async function toEmergency(c) {
   if (r?.ok) emergencyMsg.value = `已转报为安全事件 ${r.code}，可在「应急指挥」页面分级处置`
   else emergencyMsg.value = r?.msg || '转报失败'
 }
+// 餐饮质量投诉 → 供应商批次召回（自动定位问题商铺物资与首选供应商）
+async function toRecall(c) {
+  const extra_comp = Number(prompt('已售商品额外赔付（¥/份，供应商承担，可填 0）', '0') ?? '')
+  if (!Number.isFinite(extra_comp)) return
+  const handling_fee = Number(prompt('召回处置费（¥/份，供应商承担，可填 0）', '0') ?? '')
+  if (!Number.isFinite(handling_fee)) return
+  const r = await store.escalateComplaintRecall(c.id, { extra_comp, handling_fee })
+  if (r?.ok) emergencyMsg.value = `已联动发起供应商批次召回 ${r.code}，可在「供应商批次召回」页组织隔离、退款与赔付`
+  else emergencyMsg.value = r?.msg || '转召回失败'
+}
 const emergencyMsg = ref('')
 function resolveC(c) { store.resolveComplaint(c.id, compChoice.value[c.id] || 'apology') }
 function forceClose(c) { store.closeComplaint(c.id) }
@@ -206,6 +216,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
                 <button v-if="c.status === 'open'" class="succ" :disabled="!assignees[c.id]" @click="assign(c)">受理</button>
                 <button v-if="c.status === 'ready'" class="succ" @click="resolveC(c)">确认补偿结案</button>
                 <button v-if="c.category === 'safety' && c.status !== 'closed_resolved' && c.status !== 'closed_timeout'" class="ghost" @click="toEmergency(c)">🚨 转报应急</button>
+                <button v-if="c.category === 'food'" class="ghost" @click="toRecall(c)">🔁 转供应商批次召回</button>
                 <button v-if="c.severity < 3" class="ghost" @click="escalate(c)">⬆ 升级{{ c.escalated ? `（${c.escalations}次）` : '' }}</button>
                 <button class="danger" @click="forceClose(c)">不予补偿结案</button>
               </div>

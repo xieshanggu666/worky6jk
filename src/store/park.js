@@ -79,6 +79,15 @@ function emptyGiftStats() {
   }
 }
 
+function emptyRecallStats() {
+  return {
+    issued: 0, acknowledged: 0, quarantining: 0, refunding: 0, closed: 0, cancelled: 0, open: 0,
+    overdueSuppliers: 0,
+    qty: { affected: 0, quarantined: 0, returned: 0, destroyed: 0, sold: 0, refunded: 0 },
+    billed: 0, supplierPaid: 0, cashUnpaid: 0, parkLoss: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -158,7 +167,11 @@ export const useParkStore = defineStore('park', {
     families: s => s.data?.families || [],
     gifts: s => s.data?.gifts || [],
     giftStats: s => s.data?.giftStats || emptyGiftStats(),
-    giftConfig: s => s.data?.giftConfig || { enabled: true, familyAutoApprove: 1, claimDays: 7, maxItems: 20, minTier: 'none' }
+    giftConfig: s => s.data?.giftConfig || { enabled: true, familyAutoApprove: 1, claimDays: 7, maxItems: 20, minTier: 'none' },
+    // 供应商批次召回
+    recalls: s => s.data?.recalls || [],
+    recallStats: s => s.data?.recallStats || emptyRecallStats(),
+    recallConst: s => s.data?.recallConst || { severityNames: { 1: '一般', 2: '严重', 3: '紧急' }, reasonNames: {}, ackSlaTicks: 6 }
   },
   actions: {
     async refresh() {
@@ -331,6 +344,19 @@ export const useParkStore = defineStore('park', {
     declineGift(id, member_id) { return this.api('POST', `/gifts/${id}/decline`, { member_id, request_id: newRequestId() }) },
     recallGift(id, payload) { return this.api('POST', `/gifts/${id}/recall`, { ...payload, request_id: newRequestId() }) },
     saveGiftConfig(payload) { return this.api('POST', '/gift-config', payload) },
-    async giftDetail(id) { return j('GET', `/gifts/${id}`) }
+    async giftDetail(id) { return j('GET', `/gifts/${id}`) },
+    // 供应商批次召回
+    createRecall(payload) { return this.api('POST', '/recalls', { ...payload, request_id: newRequestId() }) },
+    acknowledgeRecall(id, payload) { return this.api('POST', `/recalls/${id}/acknowledge`, { ...payload, request_id: newRequestId() }) },
+    forceRecall(id, payload) { return this.api('POST', `/recalls/${id}/force`, { ...payload, request_id: newRequestId() }) },
+    quarantineRecall(id, payload) { return this.api('POST', `/recalls/${id}/quarantine`, { ...payload, request_id: newRequestId() }) },
+    returnRecall(id, payload) { return this.api('POST', `/recalls/${id}/return`, { ...payload, request_id: newRequestId() }) },
+    refundRecall(id, payload) { return this.api('POST', `/recalls/${id}/refund`, { ...payload, request_id: newRequestId() }) },
+    payRecall(id, amount, note) { return this.api('POST', `/recalls/${id}/pay`, { amount, note, request_id: newRequestId() }) },
+    closeRecall(id, payload) { return this.api('POST', `/recalls/${id}/close`, { ...payload, request_id: newRequestId() }) },
+    cancelRecall(id, note) { return this.api('POST', `/recalls/${id}/cancel`, { note, request_id: newRequestId() }) },
+    async recallDetail(id) { return j('GET', `/recalls/${id}`) },
+    async recallCandidates(query = '') { return j('GET', `/recall-candidates${query}`) },
+    escalateComplaintRecall(complaintId, payload) { return this.api('POST', `/complaints/${complaintId}/escalate-recall`, { ...payload, request_id: newRequestId() }) }
   }
 })

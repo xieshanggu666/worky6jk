@@ -328,6 +328,41 @@ export function organicReturn(vendorId, qty, { refund = null, complaintId = null
   }
 }
 
+// 供应商批次召回：联营已售商品召回退款的分账红冲
+// 与普通退货不同：不回补库存、不冲 FEFO 批次成本（货在游客手中按召回销毁/追回，成本由供应商承担）；
+// 商户批次成本、处置费与额外赔付在 recall_refunds 单独累计，随结算账单支付给商户（供应商资金来源）。
+export function recordRecallChargeback(vendorId, { qty = 1, refund, recallId, note = '' } = {}) {
+  const contract = activeContract(vendorId)
+  if (!contract) return { ok: false, code: 'NO_CONTRACT', msg: '商铺无有效联营合同' }
+  const v = getVendor(vendorId)
+  const q = Math.max(1, Math.round(num(qty)))
+  const refundAmt = Math.max(0, Math.round(num(refund) ?? q * (v?.price || 0)))
+  try {
+    let rowId
+    tx(() => {
+      const grossNeg = -Math.round(q * (v?.price || 0))
+      const billNeg = -refundAmt
+      const parkShareN = Math.round(billNeg * contract.commission_rate)
+      const merchantShareN = billNeg - parkShareN
+      const id = db.prepare('SELECT COALESCE(MAX(id),0)+1 i FROM partner_sales').get().i
+      const r = db.prepare(`INSERT INTO partner_sales
+        (code,vendor_id,contract_id,member_id,source,qty,gross,bill_amount,member_discount,
+         merchant_share,park_share,merchant_discount_borne,park_discount_borne,
+         commission_rate,member_discount_share,kind,origin_sale_id,complaint_id,recall_id,settlement_id,day,tick,note)
+        VALUES(?,?,?,NULL,'recall',?,?,?,0,?,?,0,0,?,?,'return',NULL,NULL,?,0,?,?,?)`)
+        .run('LS' + String(id).padStart(4, '0'), vendorId, contract.id,
+             -q, grossNeg, billNeg, merchantShareN, parkShareN,
+             contract.commission_rate, contract.member_discount_share,
+             num(recallId) || 0, ctx.day(), ctx.tick(), note || `供应商批次召回 #${recallId} 已售商品退款红冲`)
+      rowId = Number(r.lastInsertRowid)
+      logPartner('sale', rowId, 'recall_return', `召回 ${q} 份分账红冲，游客退款 ¥${refundAmt}（供应商承担）`, vendorId)
+    })
+    return { ok: true, id: rowId, refund: refundAmt }
+  } catch (e) {
+    return { ok: false, code: e.code || 'TX_FAILED', msg: e.message || '召回红冲登记失败' }
+  }
+}
+
 // 投诉处罚：结案现金补偿且投诉对象为联营商户时，按严重度罚没（园方收入，结算扣减，非新增现金）
 // 幂等：同一投诉最多一笔罚没（部分唯一索引），重复调用返回既有记录
 export function levyComplaintFine(complaint) {
@@ -371,6 +406,12 @@ function summarizePeriod(contract, dayFrom, dayTo) {
       FROM partner_sales WHERE contract_id=? AND settlement_id=0 AND day>=? AND day<=?`).get(contract.id, dayFrom, dayTo)
   const fines = db.prepare(`SELECT COALESCE(SUM(amount),0) a, COUNT(*) n FROM partner_fines
                             WHERE contract_id=? AND settlement_id=0 AND day>=? AND day<=?`).get(contract.id, dayFrom, dayTo)
+  // 供应商批次召回：园方已垫付的批次成本退回+处置费+额外赔付随账单支付给商户（供应商资金来源）
+  const recallRow = db.prepare(`SELECT
+      COALESCE(SUM(cogs_amount),0) cogs, COALESCE(SUM(fee_amount),0) fee,
+      COALESCE(SUM(comp_amount),0) comp, COUNT(*) n
+      FROM recall_refunds WHERE contract_id=? AND day>=? AND day<=?`).get(contract.id, dayFrom, dayTo)
+  const recallComp = Math.round(num(recallRow.cogs) + num(recallRow.fee) + num(recallRow.comp))
   return {
     saleCount: Math.round(num(sales.qty) * 10) / 10,
     gross: Math.round(num(sales.gross)),
@@ -380,6 +421,8 @@ function summarizePeriod(contract, dayFrom, dayTo) {
     memberDiscount: Math.round(num(sales.md)),
     merchantDiscountBorne: Math.round(num(sales.mdb)),
     fines: Math.round(num(fines.a)),
+    recallComp,
+    recallCount: num(recallRow.n),
     lineCount: num(sales.n),
     fineCount: num(fines.n)
   }
@@ -392,38 +435,40 @@ function buildSettlement(contract, { source = 'periodic', dayFrom = null, dayTo 
   if (to < from) return { ok: false, code: 'EMPTY_PERIOD', msg: '账期区间为空' }
   const sum = summarizePeriod(contract, from, to)
   const cogsInfo = ctx.partnerCogs ? ctx.partnerCogs(contract.vendor_id, from, to) : { cogs: 0 }
-  // 商户实得 = 分账应得 - 会员优惠商户承担 - 批次成本 - 投诉罚没 - 保证金扣没 + 保证金退还
+  // 商户实得 = 分账应得 - 会员优惠商户承担 - 批次成本 - 投诉罚没 - 保证金扣没 + 保证金退还 + 召回承担项
   const rawPayable = sum.merchantShare - sum.merchantDiscountBorne - cogsInfo.cogs - sum.fines
-    - Math.round(num(depositOffset)) + Math.round(num(depositRefund))
+    - Math.round(num(depositOffset)) + Math.round(num(depositRefund)) + sum.recallComp
   // 净额为负（退货红冲大于销售等）：不出账，流水保持 settlement_id=0 结转下期冲抵；终止清算时负数由保证金/园区承担，应付置 0
   if (rawPayable < 0 && source === 'periodic') {
     return { ok: false, code: 'NEGATIVE_PERIOD', msg: '本周期净额为负（退货/罚没大于销售），结转下期冲抵', carry: rawPayable }
   }
   const payable = Math.max(0, rawPayable)
-  // 无任何流水/罚没/成本且无保证金处理、非终止清算 → 不出空账
-  const empty = sum.lineCount === 0 && sum.fineCount === 0 && cogsInfo.cogs === 0
+  // 无任何流水/罚没/成本/召回承担且无保证金处理、非终止清算 → 不出空账
+  const empty = sum.lineCount === 0 && sum.fineCount === 0 && cogsInfo.cogs === 0 && sum.recallComp === 0
     && Math.round(num(depositOffset)) === 0 && Math.round(num(depositRefund)) === 0
   if (empty && source === 'periodic') return { ok: false, code: 'EMPTY_PERIOD', msg: '本周期无待结算流水' }
 
   const id0 = db.prepare('SELECT COALESCE(MAX(id),0)+1 i FROM partner_settlements').get().i
   const r = db.prepare(`INSERT INTO partner_settlements
     (code,vendor_id,contract_id,period_from,period_to,sale_count,gross,bill_amount,
-     merchant_share,park_share,member_discount,merchant_discount_borne,cogs,fines,deposit_offset,deposit_refund,payable,
-     source,status,create_day,create_tick,note)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?)`)
+     merchant_share,park_share,member_discount,merchant_discount_borne,cogs,fines,deposit_offset,deposit_refund,
+     recall_comp,payable,source,status,create_day,create_tick,note)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'draft',?,?,?)`)
     .run('JS' + String(id0).padStart(4, '0'), contract.vendor_id, contract.id, from, to,
          sum.saleCount, sum.gross, sum.billAmount, sum.merchantShare, sum.parkShare,
          sum.memberDiscount, sum.merchantDiscountBorne, cogsInfo.cogs, sum.fines,
-         Math.round(num(depositOffset)), Math.round(num(depositRefund)), payable,
+         Math.round(num(depositOffset)), Math.round(num(depositRefund)), sum.recallComp, payable,
          source, ctx.day(), ctx.tick(), note)
   const sid = Number(r.lastInsertRowid)
-  // 关联流水/罚没到本账单
+  // 关联流水/罚没/召回退款到本账单
   db.prepare('UPDATE partner_sales SET settlement_id=? WHERE contract_id=? AND settlement_id=0 AND day>=? AND day<=?')
     .run(sid, contract.id, from, to)
   db.prepare('UPDATE partner_fines SET settlement_id=? WHERE contract_id=? AND settlement_id=0 AND day>=? AND day<=?')
     .run(sid, contract.id, from, to)
+  db.prepare('UPDATE recall_refunds SET settlement_id=? WHERE contract_id=? AND settlement_id=0 AND day>=? AND day<=?')
+    .run(sid, contract.id, from, to)
   logPartner('settlement', sid, 'issue',
-    `${source === 'terminate' ? '终止清算' : '周期账单'} ${from}~${to}：应付商户 ¥${payable}（分账 ¥${sum.merchantShare} - 优惠承担 ¥${sum.merchantDiscountBorne} - 物料成本 ¥${cogsInfo.cogs} - 罚没 ¥${sum.fines}${Math.round(num(depositOffset)) ? ` - 保证金扣没 ¥${Math.round(num(depositOffset))}` : ''}${Math.round(num(depositRefund)) ? ` + 保证金退还 ¥${Math.round(num(depositRefund))}` : ''}）`,
+    `${source === 'terminate' ? '终止清算' : '周期账单'} ${from}~${to}：应付商户 ¥${payable}（分账 ¥${sum.merchantShare} - 优惠承担 ¥${sum.merchantDiscountBorne} - 物料成本 ¥${cogsInfo.cogs} - 罚没 ¥${sum.fines}${sum.recallComp ? ` + 召回承担 ¥${sum.recallComp}` : ''}${Math.round(num(depositOffset)) ? ` - 保证金扣没 ¥${Math.round(num(depositOffset))}` : ''}${Math.round(num(depositRefund)) ? ` + 保证金退还 ¥${Math.round(num(depositRefund))}` : ''}）`,
     contract.vendor_id)
   return { ok: true, id: sid, payable }
 }
@@ -459,7 +504,8 @@ export function paySettlement(id, { staffId = null } = {}) {
   try {
     return tx(() => {
       setSetting('cash', Math.round(ctx.cash() - s.payable))
-      if (s.payable > 0) ctx.logFinance?.(ctx.day(), FIN.settle, -s.payable, `「${v?.name}」联营结算 ${s.code}（${s.period_from}~${s.period_to}）`)
+      const detail = `「${v?.name}」联营结算 ${s.code}（${s.period_from}~${s.period_to}）${s.recall_comp > 0 ? `；含供应商召回承担 ¥${s.recall_comp}（批次成本+处置费+额外赔付，供应商资金来源）` : ''}`
+      if (s.payable > 0) ctx.logFinance?.(ctx.day(), FIN.settle, -s.payable, detail)
       if (s.fines > 0) ctx.logFinance?.(ctx.day(), FIN.fine, s.fines, `「${v?.name}」投诉罚没（账单 ${s.code}）`)
       db.prepare("UPDATE partner_settlements SET status='paid',pay_day=?,pay_tick=? WHERE id=?")
         .run(ctx.day(), ctx.tick(), s.id)

@@ -413,7 +413,11 @@ async function resolveF(f, ignore = false) {
             {{ b.expire_day ? `第${b.expire_day}天` : '无保质期' }}
             <em class="tag red-tag" v-if="b.expired">已过期</em>
           </span>
-          <span>{{ {in:'在库', exhausted:'已耗尽', closed:'已结清/报损'}[b.status] }}</span>
+          <span>
+            <em class="tag red-tag" v-if="b.status==='quarantined'">🛑 召回隔离停售</em>
+            <em class="tag tag-warn" v-else-if="b.status==='returned'">召回已退供应商</em>
+            <template v-else>{{ {in:'在库', exhausted:'已耗尽', closed:'已结清/报损'}[b.status] }}</template>
+          </span>
         </div>
         <div class="muted empty" v-if="!batches.length">暂无批次</div>
       </div>

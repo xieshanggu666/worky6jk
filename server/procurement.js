@@ -57,7 +57,7 @@ function setOnHand(materialId, qty) {
     .run(materialId, round1(qty), ctx.tick())
 }
 
-// 可销售批次：在库、有剩余、未过期；先到期先出（FEFO，无保质期排最后）
+// 可销售批次：在库、有剩余、未过期、未被召回隔离；先到期先出（FEFO，无保质期排最后）
 function saleableBatches(materialId) {
   const day = ctx.day()
   return db.prepare(`SELECT * FROM inbound_batches
@@ -962,6 +962,22 @@ export function listBatches({ materialId = null, expiring = false, limit = 200 }
   }))
 }
 
+// 召回隔离批次查询（召回页选择批次用）：默认全部在库/隔离中、有剩余的批次
+export function listQuarantineBatches({ supplierId = null, materialId = null, includeQuarantined = true } = {}) {
+  const where = ["qty_remain>0", "status IN ('in','quarantined','partial')"]
+  const args = []
+  if (!includeQuarantined) where.push("status='in'")
+  if (supplierId) { where.push('supplier_id=?'); args.push(num(supplierId)) }
+  if (materialId) { where.push('material_id=?'); args.push(num(materialId)) }
+  const rows = db.prepare(`SELECT * FROM inbound_batches WHERE ${where.join(' AND ')} ORDER BY material_id,
+                           CASE WHEN expire_day=0 THEN 1 ELSE 0 END, expire_day, id LIMIT 500`).all(...args)
+  return rows.map(b => ({
+    ...b, material_name: getMaterial(b.material_id)?.name || '',
+    unit: getMaterial(b.material_id)?.unit || '',
+    supplier_name: b.supplier_id ? db.prepare('SELECT name FROM suppliers WHERE id=?').get(b.supplier_id)?.name || '' : ''
+  }))
+}
+
 export function listReturns({ kind = null, limit = 100 } = {}) {
   const rows = kind
     ? db.prepare('SELECT * FROM purchase_returns WHERE kind=? ORDER BY id DESC LIMIT ?').all(kind, limit)
@@ -985,6 +1001,134 @@ export function partnerCogs(vendorId, dayFrom, dayTo) {
         AND sm.day>=? AND sm.day<=?`).get(vendorId, dayFrom, dayTo)
   const cogs = Math.max(0, Math.round(num(row.sold_cost) - num(row.return_cost)))
   return { cogs, soldCost: Math.round(num(row.sold_cost)), returnCost: Math.round(num(row.return_cost)) }
+}
+
+// ========================================================================
+// 供应商批次召回联动（由 recalls.js 在其事务内调用，函数自身不再开事务）
+// ====================================================================
+// 召回期间已售商品流出：按物资+区间汇总商铺销售扣减（散客 sale + 联营 partner_sale），
+// 供召回单按商铺核定「已售需召回/退款」数量；销售退货回补不计入。
+// 召回期间已售商品流出：按物资+区间汇总商铺销售扣减（散客 sale + 联营 partner_sale），
+// 供召回单按商铺核定「已售需召回/退款」数量；销售退货回补不计入。
+// 精确模式（opts.batchIds）：仅统计指定召回批次的销售；否则按供应商+物资+区间（自动召回场景）。
+export function recallOutflow(materialIds, opts = {}) {
+  const dayFrom = opts.dayFrom ?? 0
+  const dayTo = opts.dayTo ?? ctx.day()
+  const batchIds = Array.isArray(opts.batchIds) ? opts.batchIds.filter(Boolean) : []
+  const map = new Map()   // vendorId -> { qty, byMaterial: Map }
+  const add = (vendorId, materialId, qty) => {
+    if (!vendorId || qty <= 0) return
+    if (!map.has(vendorId)) map.set(vendorId, { vendorId, qty: 0, byMaterial: new Map() })
+    const e = map.get(vendorId)
+    e.qty = round1(e.qty + qty)
+    e.byMaterial.set(materialId, round1((e.byMaterial.get(materialId) || 0) + qty))
+  }
+  if (!materialIds || !materialIds.length) return map
+  let rows = []
+  if (batchIds.length) {
+    const ph = batchIds.map(() => '?').join(',')
+    rows = db.prepare(`SELECT vendor_id, material_id, COALESCE(SUM(-change),0) q
+                       FROM stock_movements
+                       WHERE batch_id IN (${ph}) AND reason IN ('sale','partner_sale')
+                         AND day>=? AND day<=?
+                       GROUP BY vendor_id, material_id`).all(...batchIds, dayFrom, dayTo)
+  } else {
+    const ph = materialIds.map(() => '?').join(',')
+    const sup = num(opts.supplierId) || 0
+    rows = db.prepare(`SELECT sm.vendor_id, sm.material_id, COALESCE(SUM(-sm.change),0) q
+                       FROM stock_movements sm JOIN inbound_batches b ON b.id=sm.batch_id
+                       WHERE sm.material_id IN (${ph}) AND sm.reason IN ('sale','partner_sale')
+                         AND (?=0 OR b.supplier_id=?) AND sm.day>=? AND sm.day<=?
+                       GROUP BY sm.vendor_id, sm.material_id`)
+      .all(...materialIds, sup, sup, dayFrom, dayTo)
+  }
+  for (const r of rows) add(r.vendor_id, r.material_id, round1(r.q))
+  return map
+}
+
+// 隔离召回批次：批次置 quarantined 并打召回标记（不扣现存，可用量经 saleableBatches 自动剔除）
+export function quarantineRecallBatch(batchId, qty, recallId) {
+  const b = db.prepare('SELECT * FROM inbound_batches WHERE id=?').get(num(batchId))
+  if (!b) throw new ProcError('NOT_FOUND', '入库批次不存在')
+  const q = Math.min(round1(num(qty)), round1(b.qty_remain))
+  if (q <= 0) throw new ProcError('BAD_ARG', '隔离数量须大于 0')
+  if (b.status === 'quarantined' && b.recall_id && b.recall_id !== num(recallId)) {
+    throw new ProcError('BATCH_HELD', `批次 ${b.code} 已被召回单 #${b.recall_id} 隔离`)
+  }
+  if (b.status !== 'in' && b.status !== 'quarantined') throw new ProcError('BAD_STATUS', `批次状态 ${b.status} 不可隔离`)
+  db.prepare("UPDATE inbound_batches SET status='quarantined', recall_id=? WHERE id=?").run(num(recallId), b.id)
+  logMovement(b.material_id, b.id, null, 0, onHand(b.material_id), 'recall_quarantine', 'recall', num(recallId))
+  return { batchId: b.id, qty: q }
+}
+
+// 召回批次退回供应商：扣批次剩余与现存（隔离时未动现存，退货时实际出园才核减）
+export function recallReturnBatch(batchId, qty, recallId) {
+  const b = db.prepare('SELECT * FROM inbound_batches WHERE id=?').get(num(batchId))
+  if (!b) throw new ProcError('NOT_FOUND', '入库批次不存在')
+  const q = Math.min(round1(num(qty)), round1(b.qty_remain))
+  if (q <= 0) throw new ProcError('BAD_ARG', '退货数量须大于 0')
+  const left = round1(b.qty_remain - q)
+  db.prepare('UPDATE inbound_batches SET qty_remain=?, status=? WHERE id=?')
+    .run(left, left <= 0 ? 'returned' : 'quarantined', b.id)
+  if (left <= 0) db.prepare('UPDATE inbound_batches SET recall_id=0 WHERE id=?').run(b.id)
+  const after = round1(onHand(b.material_id) - q)
+  setOnHand(b.material_id, after)
+  logMovement(b.material_id, b.id, null, -q, after, 'recall_return', 'recall', num(recallId))
+  return { batchId: b.id, qty, unitCost: b.unit_cost, orderId: b.order_id ?? null, supplierId: b.supplier_id ?? null, left }
+}
+
+// 召回批次销毁/报损（供应商不收回的隔离余货）：现存核减，按批次成本记物料损失
+export function recallDestroyBatch(batchId, qty, recallId) {
+  const b = db.prepare('SELECT * FROM inbound_batches WHERE id=?').get(num(batchId))
+  if (!b) throw new ProcError('NOT_FOUND', '入库批次不存在')
+  const q = Math.min(round1(num(qty)), round1(b.qty_remain))
+  if (q <= 0) throw new ProcError('BAD_ARG', '销毁数量须大于 0')
+  const left = round1(b.qty_remain - q)
+  db.prepare("UPDATE inbound_batches SET qty_remain=?, status=?, recall_id=? WHERE id=?")
+    .run(left, left <= 0 ? 'closed' : 'quarantined', left <= 0 ? 0 : num(recallId), b.id)
+  const after = round1(onHand(b.material_id) - q)
+  setOnHand(b.material_id, after)
+  logMovement(b.material_id, b.id, null, -q, after, 'recall_destroy', 'recall', num(recallId))
+  const cost = Math.round(q * b.unit_cost)
+  return { batchId: b.id, qty, unitCost: b.unit_cost, cost, left }
+}
+
+// 解除整批隔离（撤销召回）：恢复可售状态并清召回标记
+export function releaseRecallBatch(batchId, recallId) {
+  const b = db.prepare('SELECT * FROM inbound_batches WHERE id=?').get(num(batchId))
+  if (!b || b.recall_id !== num(recallId)) return
+  db.prepare("UPDATE inbound_batches SET status='in', recall_id=0 WHERE id=? AND status='quarantined'").run(b.id)
+  logMovement(b.material_id, b.id, null, 0, onHand(b.material_id), 'recall_release', 'recall', num(recallId))
+}
+
+// 采购单未付应付（召回退已付/未付货款时区分冲抵与现金应收）
+export function purchaseOutstanding(orderId) {
+  const o = db.prepare('SELECT * FROM purchase_orders WHERE id=?').get(num(orderId))
+  return o ? outstandingOf(o) : 0
+}
+
+// 召回退货登记采购退货单（不改动库存，库存已由 recallReturnBatch 核减），并冲减采购单应付
+export function recordRecallReturnLine({ orderId, batchId, materialId, qty, amount, recallId }) {
+  const rid = db.prepare(`INSERT INTO purchase_returns(kind,order_id,batch_id,material_id,qty,amount,reason,status,create_tick,create_day)
+                          VALUES('purchase',?,?,?,?,?,? ,'done',?,?)`)
+    .run(orderId || null, batchId || null, num(materialId), round1(num(qty)), Math.round(num(amount)),
+         `供应商批次召回 #${num(recallId)} 退货`, ctx.tick(), ctx.day())
+  const id = Number(rid.lastInsertRowid)
+  stampCode('purchase_returns', 'id', id, 'RT')
+  if (orderId) logOrder(orderId, 'return', `召回单 ZH${String(num(recallId)).padStart(4, '0')} 批次退货，冲抵/应收货款 ¥${Math.round(num(amount))}`)
+  return id
+}
+
+// 供应商评级（召回结案联动）：delta 为负扣分，下限 1
+export function adjustSupplierRating(supplierId, delta) {
+  const s = db.prepare('SELECT * FROM suppliers WHERE id=?').get(num(supplierId))
+  if (!s || !delta) return
+  const rating = Math.max(1, Math.min(5, s.rating + delta))
+  db.prepare('UPDATE suppliers SET rating=? WHERE id=?').run(rating, s.id)
+  return rating
+}
+export function setSupplierStatus(supplierId, status) {
+  db.prepare('UPDATE suppliers SET status=? WHERE id=?').run(status === 'suspended' ? 'suspended' : 'active', num(supplierId))
 }
 
 export function procurementStats() {

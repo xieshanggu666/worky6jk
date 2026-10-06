@@ -60,7 +60,10 @@ import {
   createOrder, submitOrder, approveOrder, rejectOrder, receiveOrder, payOrder, purchaseReturn,
   listOrders, orderDetail, listBatches, listReturns,
   createStocktake, submitStocktake, approveStocktake, cancelStocktake, listStocktakes, stocktakeDetail,
-  listInventoryFindings, resolveInventoryFinding, ignoreInventoryFinding, procurementStats
+  listInventoryFindings, resolveInventoryFinding, ignoreInventoryFinding, procurementStats,
+  quarantineRecallBatch, recallReturnBatch, recallDestroyBatch, releaseRecallBatch, recallOutflow,
+  purchaseOutstanding, recordRecallReturnLine, adjustSupplierRating, setSupplierStatus,
+  listQuarantineBatches
 } from './procurement.js'
 import {
   initPartnerContext,
@@ -69,6 +72,7 @@ import {
   listContracts, contractDetail, terminateContract, activeContract as activePartnerContract,
   recordSale as partnerRecordSale, isPartnerVendor,
   organicReturn, recordReturn as partnerRecordReturn,
+  recordRecallChargeback,
   levyComplaintFine,
   issueSettlement, paySettlement, retryOverdueSettlements, autoIssueSettlements,
   listSales as listPartnerSales, listSettlements, settlementDetail, listFines,
@@ -82,6 +86,12 @@ import {
   sweepExpiredGifts, reconcileGifts,
   listGifts, giftDetail, claimableGiftsFor, giftStats, getGiftConfig, saveGiftConfig
 } from './gifts.js'
+import {
+  initRecallContext,
+  createRecall, acknowledgeRecall, forceAcknowledge, quarantineRecall,
+  returnRecallBatches, refundRecallSold, payRecall, closeRecall, cancelRecall,
+  processRecallTick, listRecalls, recallDetail, recallStats, RECALL_CONST
+} from './recalls.js'
 
 const app = express()
 app.use(express.json())
@@ -218,6 +228,28 @@ initEmergencyContext({
   closeComplaintLinked: (cid, inc, kind, meta) => closeLinkedComplaint(cid, inc, kind, meta),
   staffDutyState: (staffId) => staffDutyState(staffId),
   dispatchAfter: (reason) => { try { maybeDispatchAfter(reason) } catch { /* 调度失败不阻塞应急流程 */ } }
+})
+
+// 供应商批次召回：供应商/园方/联营商户三方协同，联动库存隔离、销售退款、采购应付、联营分账、投诉与事件通知
+initRecallContext({
+  logFinance,
+  quarantineRecallBatch: (...a) => quarantineRecallBatch(...a),
+  recallReturnBatch: (...a) => recallReturnBatch(...a),
+  recallDestroyBatch: (...a) => recallDestroyBatch(...a),
+  releaseRecallBatch: (...a) => releaseRecallBatch(...a),
+  recallOutflow: (...a) => recallOutflow(...a),
+  purchaseOutstanding: (...a) => purchaseOutstanding(...a),
+  recordRecallReturnLine: (...a) => recordRecallReturnLine(...a),
+  adjustSupplierRating: (...a) => adjustSupplierRating(...a),
+  setSupplierStatus: (...a) => setSupplierStatus(...a),
+  activePartnerContract: (...a) => activePartnerContract(...a),
+  recordRecallChargeback: (...a) => recordRecallChargeback(...a),
+  createComplaint: (payload) => createComplaint(payload),
+  closeComplaintLinked: (cid, inc, kind, meta) => closeLinkedComplaint(cid, inc, kind, meta),
+  emitEvent: (type, title, desc, impact) => {
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(state.tick(), state.day(), type, title, desc, impact, 'active')
+  }
 })
 
 // ---------------- 分期贷款 ----------------
@@ -905,6 +937,8 @@ function tick() {
 
   // 物资采购与库存：缺货自动补货草稿、已批准采购单自动到货、批次过期报损、缺货/临期/逾期应付巡检
   processProcurementTick()
+  // 供应商批次召回：供应商超时未应答事件通知
+  processRecallTick()
   // 在途重大事件持续侵蚀声誉（游客对园区安全失去信心）
   const severeOpen = db.prepare(`SELECT COUNT(*) n FROM incidents
     WHERE status IN ('graded','contained','evacuating','controlled') AND severity>=3`).get().n
@@ -1165,6 +1199,14 @@ app.get('/api/state', (req, res) => {
     stockBatches: listBatches({ expiring: true, limit: 50 }),
     stocktakes: listStocktakes({ limit: 30 }),
     purchaseReturns: listReturns({ limit: 50 }),
+    // 供应商批次召回
+    recalls: listRecalls({ limit: 80 }),
+    recallStats: recallStats(),
+    recallConst: {
+      severityNames: RECALL_CONST.SEVERITY,
+      reasonNames: RECALL_CONST.REASON,
+      ackSlaTicks: RECALL_CONST.ACK_SLA_TICKS
+    },
     // 园区联营商户结算
     partnerStats: partnerStats(),
     partnerApplications: listApplications({ limit: 50 }),
@@ -1463,6 +1505,9 @@ app.get('/api/purchase-returns', (req, res) => res.json({ ok: true, list: listRe
 // 入库批次
 app.get('/api/stock-batches', (req, res) =>
   res.json({ ok: true, list: listBatches({ materialId: req.query.material_id ? num(req.query.material_id) : null, expiring: req.query.expiring === '1' }) }))
+// 召回可选批次（按供应商/物资过滤，含已隔离批次）
+app.get('/api/recall-candidates', (req, res) =>
+  res.json({ ok: true, list: listQuarantineBatches({ supplierId: req.query.supplier_id ? num(req.query.supplier_id) : null, materialId: req.query.material_id ? num(req.query.material_id) : null }) }))
 
 // 盘点
 app.get('/api/stocktakes', (req, res) => res.json({ ok: true, list: listStocktakes({ status: req.query.status || null }) }))
@@ -1481,6 +1526,94 @@ app.get('/api/inventory-findings', (req, res) =>
   res.json({ ok: true, list: listInventoryFindings({ status: req.query.status || null, type: req.query.type || null }) }))
 app.post('/api/inventory-findings/:id/resolve', (req, res) => reply(req, res, resolveInventoryFinding(num(req.params.id), req.body?.note || '')))
 app.post('/api/inventory-findings/:id/ignore', (req, res) => reply(req, res, ignoreInventoryFinding(num(req.params.id), req.body?.note || '')))
+
+// ---- 供应商批次召回：供应商/园方/联营商户协同（隔离·退款·退货·赔付） ----
+app.get('/api/recalls', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    ok: true,
+    list: listRecalls({ status: q.status && q.status !== 'all' ? q.status : null, supplierId: q.supplier_id ? num(q.supplier_id) : null }),
+    stats: recallStats(),
+    const: { severityNames: RECALL_CONST.SEVERITY, reasonNames: RECALL_CONST.REASON, ackSlaTicks: RECALL_CONST.ACK_SLA_TICKS }
+  })
+})
+app.get('/api/recalls/:id', (req, res) => {
+  const d = recallDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '召回单不存在' })
+  res.json({ ok: true, data: d })
+})
+// 发起召回（可指定入库批次；食安/紧急自动联动餐饮投诉与事件通知）
+app.post('/api/recalls', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createRecall({
+    supplier_id: num(b.supplier_id),
+    reason_type: String(b.reason_type || 'quality'),
+    severity: num(b.severity, 2),
+    title: String(b.title || ''),
+    reason: String(b.reason || ''),
+    source: String(b.source || 'manual'),
+    complaint_id: num(b.complaint_id) || null,
+    items: Array.isArray(b.items) ? b.items : [],
+    extra_comp: num(b.extra_comp),
+    handling_fee: num(b.handling_fee),
+    staff_id: num(b.staff_id) || null,
+    requestId: idemKey(req)
+  }), 201)
+})
+// 供应商应答（接受/异议）
+app.post('/api/recalls/:id/acknowledge', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, acknowledgeRecall(num(req.params.id), {
+    accept: b.accept !== false, note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req)
+  }))
+})
+// 园方强制推进（供应商异议/超时）
+app.post('/api/recalls/:id/force', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, forceAcknowledge(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req) }))
+})
+// 在库批次隔离（自动停售）；body.batch_ids 可选，缺省隔离全部待隔离批次/自动按 FEFO 补选
+app.post('/api/recalls/:id/quarantine', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, quarantineRecall(num(req.params.id), {
+    batchIds: Array.isArray(b.batch_ids) ? b.batch_ids.map(num) : null,
+    staffId: num(b.staff_id) || null, requestId: idemKey(req)
+  }))
+})
+// 隔离批次退回供应商（冲采购应付/登记现金应收）
+app.post('/api/recalls/:id/return', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, returnRecallBatches(num(req.params.id), {
+    batchIds: Array.isArray(b.batch_ids) ? b.batch_ids.map(num) : null,
+    staffId: num(b.staff_id) || null, requestId: idemKey(req)
+  }))
+})
+// 已售商品召回退款（自营现金退/联营分账红冲，批次成本与处置费随联营账单付商户）
+app.post('/api/recalls/:id/refund', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, refundRecallSold(num(req.params.id), {
+    vendorId: num(b.vendor_id), qty: num(b.qty, 1), materialId: num(b.material_id) || null,
+    note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req)
+  }))
+})
+// 供应商现金赔付
+app.post('/api/recalls/:id/pay', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, payRecall(num(req.params.id), num(b.amount), { note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req) }))
+})
+// 结案（余货销毁、供应商评级/暂停合作、投诉闭环）
+app.post('/api/recalls/:id/close', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, closeRecall(num(req.params.id), {
+    writeOff: !!b.write_off, suspendSupplier: b.suspend_supplier === undefined ? null : !!b.suspend_supplier,
+    note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req)
+  }))
+})
+// 撤销召回（未隔离/未退款前）
+app.post('/api/recalls/:id/cancel', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, cancelRecall(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null, requestId: idemKey(req) }))
+})
 
 // ---- 员工 ----
 const ROLES = ['保安', '保洁', '维修', '会员专员', '运营主管']
@@ -2520,6 +2653,42 @@ app.post('/api/complaints/:id/escalate-incident', (req, res) => {
   const b = req.body || {}
   reply(req, res, escalateFromComplaint(num(req.params.id), {
     staffId: b.staff_id ? num(b.staff_id) : null, requestId: idemKey(req)
+  }), 201)
+})
+
+// 餐饮质量投诉 → 供应商批次召回（投诉联动发起：自动带入问题商铺涉及物资与供应商）
+app.post('/api/complaints/:id/escalate-recall', (req, res) => {
+  const b = req.body || {}
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(num(req.params.id))
+  if (!c) return res.status(404).json({ ok: false, msg: '投诉不存在' })
+  if (c.category !== 'food') return res.status(400).json({ ok: false, msg: '仅餐饮质量类投诉可转供应商批次召回' })
+  let supplierId = num(b.supplier_id)
+  let items = Array.isArray(b.items) ? b.items : []
+  if (!supplierId || !items.length) {
+    // 未显式传参：按问题商铺挂供的物资及其首选供应商推导
+    const vendorId = c.target_type === 'vendor' ? num(c.target_id) : num(b.vendor_id)
+    const mids = vendorId
+      ? db.prepare('SELECT material_id FROM vendor_materials WHERE vendor_id=?').all(vendorId).map(x => x.material_id)
+      : []
+    if (!mids.length) return res.status(400).json({ ok: false, msg: '问题商铺未挂供货物资，无法自动定位召回批次，请手动选择供应商与批次' })
+    const m0 = db.prepare('SELECT * FROM materials WHERE id=?').get(mids[0])
+    supplierId = supplierId || m0?.preferred_supplier_id
+    if (!supplierId) return res.status(400).json({ ok: false, msg: '物资未配置首选供应商，请手动选择' })
+    items = mids.map(material_id => ({ material_id, batch_ids: b.batch_ids || [] }))
+  }
+  reply(req, res, createRecall({
+    supplier_id: supplierId,
+    reason_type: b.reason_type || 'safety',
+    severity: b.severity ? num(b.severity) : Math.max(2, c.severity),
+    title: b.title || `餐饮投诉 ${c.code} 联动供应商召回`,
+    reason: b.reason || c.content || '游客餐饮质量投诉，启动供应商批次召回',
+    source: 'complaint',
+    complaint_id: c.id,
+    items,
+    extra_comp: num(b.extra_comp),
+    handling_fee: num(b.handling_fee),
+    staff_id: num(b.staff_id) || null,
+    requestId: idemKey(req)
   }), 201)
 })
 
