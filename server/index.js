@@ -82,6 +82,13 @@ import {
   sweepExpiredGifts, reconcileGifts,
   listGifts, giftDetail, claimableGiftsFor, giftStats, getGiftConfig, saveGiftConfig
 } from './gifts.js'
+import {
+  initRecallContext,
+  createRecall, acceptRecall, acknowledgeVendor, vendorRefund, markVendorNone,
+  returnBatches, destroyBatches, payCompensation, compensationQuote,
+  closeRecall, closeFalseRecall, cancelRecall,
+  listRecalls, recallDetail, recallStats
+} from './recalls.js'
 
 const app = express()
 app.use(express.json())
@@ -218,6 +225,36 @@ initEmergencyContext({
   closeComplaintLinked: (cid, inc, kind, meta) => closeLinkedComplaint(cid, inc, kind, meta),
   staffDutyState: (staffId) => staffDutyState(staffId),
   dispatchAfter: (reason) => { try { maybeDispatchAfter(reason) } catch { /* 调度失败不阻塞应急流程 */ } }
+})
+
+// 供应商批次召回：注入时钟/现金/财务、投诉建单与召回闭环、联营红冲与联营判定
+// 投诉联动：发起召回自动建餐饮质量投诉；结案/误报/撤销时把该投诉随召回闭环（退款赔付已在召回侧完成）
+initRecallContext({
+  day: () => state.day(),
+  hour: () => state.hour(),
+  tick: () => state.tick(),
+  deductCash: (amount) => setSetting('cash', Math.round(state.cash() - amount)),
+  addCash: (amount) => setSetting('cash', Math.round(state.cash() + amount)),
+  logFinance: (day, label, amount, detail) => logFinance(day, label, amount, detail),
+  createComplaint: (payload) => createComplaint(payload),
+  closeComplaint: (cid, kind, meta) => {
+    if (kind === 'recall_closed') {
+      db.prepare(`UPDATE complaints SET status='closed_resolved', compensation='cash', comp_cost=?,
+                  rating=4, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+        .run(meta.compensation || meta.refund || 0,
+             `供应商批次召回 ${meta.recallCode || ''} 已完成隔离、退货退款与赔付，投诉随召回闭环`,
+             state.tick(), state.day(), cid)
+      logComplaint(cid, 'resolve', `关联供应商批次召回 ${meta.recallCode || ''} 闭环：游客退款 ¥${meta.refund || 0}、供应商赔付 ¥${meta.compensation || 0}，投诉结案`)
+    } else {
+      // recall_false：误报/撤销，批次复检合格，中性结案（不补偿现金、不触发差评）
+      db.prepare(`UPDATE complaints SET status='closed_force', close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+        .run(`供应商批次召回 ${meta.recallCode || ''} 经核实批次合格（${meta.note || '误报/已撤销'}），现场无质量问题`,
+             state.tick(), state.day(), cid)
+      logComplaint(cid, 'force', `关联召回 ${meta.recallCode || ''} 为误报/已撤销，投诉中性闭环`)
+    }
+  },
+  organicPartnerReturn: (vendorId, qty, opts) => organicReturn(vendorId, qty, opts),
+  isPartnerVendor: (vendorId) => isPartnerVendor(vendorId)
 })
 
 // ---------------- 分期贷款 ----------------
@@ -1177,6 +1214,9 @@ app.get('/api/state', (req, res) => {
     giftConfig: getGiftConfig(),
     families: listFamilies({ limit: 100 }),
     gifts: listGifts({ limit: 120 }),
+    // 供应商批次召回（供应商×园方×联营商户协同）
+    recalls: listRecalls({ limit: 100 }),
+    recallStats: recallStats(),
     avgs: {
       satisfaction: computeSatisfaction(),
       openRatio: rides.length ? operatingRides().length / rides.length : 0
@@ -2394,6 +2434,69 @@ app.post('/api/gifts/:id/recall', (req, res) => {
 app.post('/api/gift-config', (req, res) => {
   reply(req, res, saveGiftConfig(req.body || {}))
 })
+
+// ---------------- 供应商批次召回：供应商 / 园方 / 联营商户 三方协同 ----------------
+app.get('/api/recalls', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listRecalls({ status: q.status && q.status !== 'all' ? q.status : null, limit: 200 }),
+    stats: recallStats()
+  })
+})
+app.get('/api/recalls/:id', (req, res) => {
+  const d = recallDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '召回单不存在' })
+  res.json({ ok: true, ...d })
+})
+
+// 发起召回：隔离批次（指定或该物资全部在库批次）、通知受影响商铺、联动餐饮投诉与事件
+app.post('/api/recalls', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createRecall({
+    supplier_id: num(b.supplier_id),
+    material_id: num(b.material_id),
+    batches: Array.isArray(b.batches) ? b.batches : [],
+    reason: String(b.reason || ''),
+    severity: num(b.severity, 2),
+    notify_vendors: b.notify_vendors !== false,
+    staffId: num(b.staff_id) || null
+  }), 201)
+})
+// 供应商受理（issued→processing）
+app.post('/api/recalls/:id/accept', (req, res) =>
+  reply(req, res, acceptRecall(num(req.params.id), { staffId: num(req.body?.staff_id) || null, note: req.body?.note || '' })))
+// 联营商户确认知悉
+app.post('/api/recalls/:id/vendors/:vendorId/acknowledge', (req, res) =>
+  reply(req, res, acknowledgeVendor(num(req.params.id), num(req.params.vendorId), { note: req.body?.note || '' })))
+// 商铺为游客办理退货退款（自营退现金/联营红冲分账，问题品不回库）
+app.post('/api/recalls/:id/vendors/:vendorId/refund', (req, res) =>
+  reply(req, res, vendorRefund(num(req.params.id), num(req.params.vendorId), num(req.body?.qty, 1), {
+    note: req.body?.note || '', staffId: num(req.body?.staff_id) || null
+  })))
+// 商铺确认无在途游客/已线下退换（放行结案，不再系统退款）
+app.post('/api/recalls/:id/vendors/:vendorId/none', (req, res) =>
+  reply(req, res, markVendorNone(num(req.params.id), num(req.params.vendorId), { note: req.body?.note || '' })))
+// 隔离批次退回供应商（货款冲应付/退现金）
+app.post('/api/recalls/:id/return', (req, res) =>
+  reply(req, res, returnBatches(num(req.params.id), num(req.body?.qty), { staffId: num(req.body?.staff_id) || null })))
+// 隔离批次现场销毁（核销物料成本）
+app.post('/api/recalls/:id/destroy', (req, res) =>
+  reply(req, res, destroyBatches(num(req.params.id), num(req.body?.qty), { staffId: num(req.body?.staff_id) || null, note: req.body?.note || '' })))
+// 赔付报价（只读）
+app.get('/api/recalls/:id/compensation', (req, res) =>
+  res.json(compensationQuote(num(req.params.id))))
+// 供应商赔付到账
+app.post('/api/recalls/:id/compensation', (req, res) =>
+  reply(req, res, payCompensation(num(req.params.id), num(req.body?.amount), { staffId: num(req.body?.staff_id) || null, note: req.body?.note || '' })))
+// 结案（批次须已全部退供/销毁）
+app.post('/api/recalls/:id/close', (req, res) =>
+  reply(req, res, closeRecall(num(req.params.id), { note: req.body?.note || '', staffId: num(req.body?.staff_id) || null })))
+// 误报结案（解除隔离恢复销售）
+app.post('/api/recalls/:id/false', (req, res) =>
+  reply(req, res, closeFalseRecall(num(req.params.id), { reason: req.body?.reason || '', staffId: num(req.body?.staff_id) || null })))
+// 撤销（仅待受理）
+app.post('/api/recalls/:id/cancel', (req, res) =>
+  reply(req, res, cancelRecall(num(req.params.id), { reason: req.body?.reason || '', staffId: num(req.body?.staff_id) || null })))
 
 // ---------------- 园区应急指挥：安全事件 发现→分级→封控→疏散→复园→复盘 ----------------
 // 多角色协作：运营（分级/封控/复园/复盘/核定理赔）、安保（疏散上报/到场/撤防）、游客（上报/理赔）

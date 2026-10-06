@@ -91,7 +91,7 @@ async function openMovements(m) {
   if (r.ok) moveData.value.list = r.list
   moveModal.value = true
 }
-const MOVE_REASON = { in: '入库', sale: '销售', sale_return: '销售退货', purchase_return: '采购退货', adjust_gain: '盘盈', adjust_loss: '盘亏', spoil: '过期报损' }
+const MOVE_REASON = { in: '入库', sale: '销售', partner_sale: '联营销售', sale_return: '销售退货', partner_sale_return: '联营退货', purchase_return: '采购退货', recall_refund: '召回游客退款(不回库)', adjust_gain: '盘盈', adjust_loss: '盘亏', spoil: '过期报损/召回销毁' }
 
 // ---------------- 采购单 Tab ----------------
 const poFilter = ref('')
@@ -316,6 +316,7 @@ async function resolveF(f, ignore = false) {
           <span>{{ m.category }}</span>
           <span><b :class="stockCls(m.stock_status)">{{ m.qty_on_hand }} {{ m.unit }}</b>
             <em class="muted" v-if="m.expiring_qty>0" style="color:var(--accent2)"> · 临期{{m.expiring_qty}}</em>
+            <em v-if="m.quarantined_qty>0" class="tag tag-red" style="margin-left:4px">🚨 召回隔离 {{ m.quarantined_qty }}</em>
           </span>
           <span><i class="st-dot" :class="stockCls(m.stock_status)"></i>{{ stockText(m.stock_status) }}</span>
           <span>{{ m.safety_stock }}<em class="muted"> / 补货 {{ m.reorder_qty }}</em></span>
@@ -401,19 +402,20 @@ async function resolveF(f, ignore = false) {
         <button class="ghost" @click="loadBatches">刷新</button>
       </div>
       <div class="table card">
-        <div class="thead batch-head"><span>批次号</span><span>物资</span><span>来源</span><span>剩余/入库</span><span>批次单价</span><span>入库日</span><span>到期日</span><span>状态</span></div>
+        <div class="thead batch-head"><span>批次号</span><span>物资</span><span>来源</span><span>剩余/入库</span><span>隔离量</span><span>批次单价</span><span>入库日</span><span>到期日</span><span>状态</span></div>
         <div class="trow batch-head" v-for="b in batches" :key="b.id">
           <span><b>{{ b.code }}</b></span>
           <span>{{ b.material_name }}<em class="muted code">{{ b.unit }}</em></span>
           <span>{{ b.supplier_name || (b.note||'期初') }}</span>
           <span>{{ b.qty_remain }} / {{ b.qty_received }}</span>
+          <span><b v-if="b.quarantined_qty" class="neg">🚨 {{ b.quarantined_qty }}</b><em v-else class="muted">0</em></span>
           <span class="money">¥{{ b.unit_cost }}</span>
           <span>第{{b.receive_day}}天</span>
           <span :class="b.expired ? 'neg money' : b.expire_day<=day+2 ? 'warn-text' : ''">
             {{ b.expire_day ? `第${b.expire_day}天` : '无保质期' }}
             <em class="tag red-tag" v-if="b.expired">已过期</em>
           </span>
-          <span>{{ {in:'在库', exhausted:'已耗尽', closed:'已结清/报损'}[b.status] }}</span>
+          <span>{{ b.recall_id ? '召回隔离中 ' + ('ZH' + String(b.recall_id).padStart(4,'0')) : {in:'在库', exhausted:'已耗尽', closed:'已结清/报损'}[b.status] }}</span>
         </div>
         <div class="muted empty" v-if="!batches.length">暂无批次</div>
       </div>
@@ -764,7 +766,7 @@ async function resolveF(f, ignore = false) {
 .stock-head { grid-template-columns: 1.4fr .7fr .9fr .7fr .9fr .7fr .9fr .7fr 1.2fr .9fr; }
 .po-head { grid-template-columns: 1fr 1.2fr 1fr .8fr 1fr 1.2fr .7fr .7fr; }
 .link-head { grid-template-columns: 1fr .8fr 1fr 1fr; }
-.batch-head { grid-template-columns: .8fr 1.2fr 1.2fr .9fr .7fr .7fr 1fr .8fr; }
+.batch-head { grid-template-columns: .8fr 1.2fr 1.1fr .8fr .7fr .7fr .7fr 1fr 1fr; }
 .ret-head { grid-template-columns: .8fr .9fr 1.2fr .6fr .7fr 1fr 1.4fr .6fr; }
 .st-head { grid-template-columns: .8fr 1fr .7fr .8fr 1fr .7fr 1.6fr; }
 .code { display: block; font-size: 11px; font-style: normal; }

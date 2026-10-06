@@ -1157,6 +1157,85 @@ CREATE TABLE IF NOT EXISTS partner_logs (
 CREATE INDEX IF NOT EXISTS idx_plogs_ref ON partner_logs(ref_type,ref_id);
 
 -- ========================================================================
+-- 供应商批次召回：供应商 / 园方 / 联营商户 三方协同
+--   园方发起召回 → 在库批次立即隔离（停售）→ 通知受影响自营/联营商铺
+--   → 联营商户确认知悉 → 商铺按已售出量为游客退货退款（联营红冲分账）
+--   → 园方将隔离批次退回供应商（货款冲应付/退现金）或现场销毁（核销）
+--   → 供应商赔付货款损失/罚则 → 结案（关联餐饮投诉闭环、事件通知）
+-- 召回期间在库批次不可销售；隔离量独立计量，退回/销毁时才核减库存并出库存流水。
+-- ========================================================================
+
+-- 召回单：发起即隔离批次并通知；issued→processing（供应商受理）→closed/closed_false/cancelled
+CREATE TABLE IF NOT EXISTS recall_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',             -- ZH0001
+  supplier_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',           -- 召回原因（质量/异物/过期/污染…）
+  severity INTEGER NOT NULL DEFAULT 1,       -- 1 一般 / 2 严重 / 3 紧急（影响赔付罚则与投诉联动）
+  status TEXT NOT NULL DEFAULT 'issued',     -- issued 已发起待受理 / processing 受理处置中 / closed 已结案 / closed_false 误报结案 / cancelled 已撤销
+  -- 批次侧
+  batch_qty REAL NOT NULL DEFAULT 0,         -- 发起时隔离的在库总量
+  returned_qty REAL NOT NULL DEFAULT 0,      -- 已退供应商数量
+  destroyed_qty REAL NOT NULL DEFAULT 0,     -- 已现场销毁数量
+  released_qty REAL NOT NULL DEFAULT 0,      -- 撤销/误报解除隔离数量
+  return_amount INTEGER NOT NULL DEFAULT 0,  -- 退供应商货款（冲应付+现金退回）
+  destroy_cost INTEGER NOT NULL DEFAULT 0,   -- 现场销毁核销的物料成本
+  -- 销售侧（按商铺已售出净量退款）
+  affected_vendor_count INTEGER NOT NULL DEFAULT 0,
+  refund_qty REAL NOT NULL DEFAULT 0,        -- 已完成游客退货退款的数量
+  refund_amount INTEGER NOT NULL DEFAULT 0,  -- 游客退款金额（自营负商业流水；联营红冲）
+  -- 赔付侧
+  compensation_amount INTEGER NOT NULL DEFAULT 0, -- 供应商赔付到账（货款损失 + 罚则）
+  penalty_amount INTEGER NOT NULL DEFAULT 0,      -- 其中罚则金额（严重度系数，仅展示拆分）
+  complaint_id INTEGER,                      -- 发起时联动生成的餐饮质量投诉
+  event_id INTEGER,                          -- 事件通知 id
+  creator_id INTEGER,
+  note TEXT NOT NULL DEFAULT '',
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  accept_tick INTEGER NOT NULL DEFAULT 0,    -- 供应商受理时刻
+  close_tick INTEGER NOT NULL DEFAULT 0,
+  close_day INTEGER NOT NULL DEFAULT 0,
+  close_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_recall_status ON recall_orders(status);
+CREATE INDEX IF NOT EXISTS idx_recall_supplier ON recall_orders(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_recall_material ON recall_orders(material_id);
+
+-- 受影响商铺：销售过该物资批次的自营/联营商铺，隔离时按已售净量登记，退货退款逐铺确认
+CREATE TABLE IF NOT EXISTS recall_vendors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recall_id INTEGER NOT NULL,
+  vendor_id INTEGER NOT NULL,
+  is_partner INTEGER NOT NULL DEFAULT 0,     -- 0 自营 / 1 联营（退款口径与分账红冲不同）
+  sold_qty REAL NOT NULL DEFAULT 0,          -- 发起时该铺已售出的净数量（需召回游客）
+  refund_qty REAL NOT NULL DEFAULT 0,        -- 已退款数量
+  refund_amount INTEGER NOT NULL DEFAULT 0,  -- 已退款金额
+  status TEXT NOT NULL DEFAULT 'notified',   -- notified 已通知待处理 / acknowledged 商户已确认 / refunded 已退货退款 / none 无在途售出
+  notified_tick INTEGER NOT NULL DEFAULT 0,
+  notified_day INTEGER NOT NULL DEFAULT 0,
+  ack_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_recall_vendors_recall ON recall_vendors(recall_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recall_vendors_one ON recall_vendors(recall_id,vendor_id);
+
+-- 召回全生命周期时间线（发起/隔离/通知/受理/商户确认/退款/退回/销毁/赔付/结案/撤销）
+CREATE TABLE IF NOT EXISTS recall_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recall_id INTEGER NOT NULL,
+  vendor_id INTEGER,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'park',        -- park 园方 / supplier 供应商 / partner 联营商户 / system
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_recall_logs_recall ON recall_logs(recall_id);
+
+-- ========================================================================
 -- 会员权益转赠与家庭账户：
 --   会员发起转赠（指定受赠人 / 家庭共享池）→ 运营审核 → 发放（受赠人待领取 / 家庭池待领）
 --   → 受赠人领取入账 → 预约/商铺核销 → 捐赠人/运营撤回（未用返还、已用冲积分/储值）
@@ -1298,6 +1377,9 @@ ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
 ensureColumn('member_benefits', 'gift_item_id', "gift_item_id INTEGER")  // 关联 member_gift_items.id（锁定/新权益均回填）
 ensureColumn('member_benefits', 'gift_id', "gift_id INTEGER")            // 关联转赠单 member_gifts.id
 ensureColumn('member_benefits', 'origin_member_id', "origin_member_id INTEGER") // 受赠权益的原始捐赠人（转入新权益记录）
+// 供应商批次召回：批次隔离量（独立计量，不计入可售；退回供应商/销毁时才核减库存）与在途召回单
+ensureColumn('inbound_batches', 'quarantined_qty', "quarantined_qty REAL NOT NULL DEFAULT 0")
+ensureColumn('inbound_batches', 'recall_id', "recall_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。

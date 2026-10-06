@@ -79,6 +79,13 @@ function emptyGiftStats() {
   }
 }
 
+function emptyRecallStats() {
+  return {
+    open: 0, issued: 0, processing: 0, closed: 0, openBatchQty: 0, openRefund: 0,
+    pendingVendors: 0, pendingRefundVendors: 0, compensationTotal: 0, refundTotal: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -158,7 +165,11 @@ export const useParkStore = defineStore('park', {
     families: s => s.data?.families || [],
     gifts: s => s.data?.gifts || [],
     giftStats: s => s.data?.giftStats || emptyGiftStats(),
-    giftConfig: s => s.data?.giftConfig || { enabled: true, familyAutoApprove: 1, claimDays: 7, maxItems: 20, minTier: 'none' }
+    giftConfig: s => s.data?.giftConfig || { enabled: true, familyAutoApprove: 1, claimDays: 7, maxItems: 20, minTier: 'none' },
+    // 供应商批次召回
+    recalls: s => s.data?.recalls || [],
+    recallStats: s => s.data?.recallStats || emptyRecallStats(),
+    openRecalls: s => (s.data?.recalls || []).filter(r => ['issued', 'processing'].includes(r.status))
   },
   actions: {
     async refresh() {
@@ -331,6 +342,20 @@ export const useParkStore = defineStore('park', {
     declineGift(id, member_id) { return this.api('POST', `/gifts/${id}/decline`, { member_id, request_id: newRequestId() }) },
     recallGift(id, payload) { return this.api('POST', `/gifts/${id}/recall`, { ...payload, request_id: newRequestId() }) },
     saveGiftConfig(payload) { return this.api('POST', '/gift-config', payload) },
-    async giftDetail(id) { return j('GET', `/gifts/${id}`) }
+    async giftDetail(id) { return j('GET', `/gifts/${id}`) },
+    // 供应商批次召回
+    createRecall(payload) { return this.api('POST', '/recalls', payload) },
+    acceptRecall(id, staff_id) { return this.api('POST', `/recalls/${id}/accept`, { staff_id }) },
+    acknowledgeRecallVendor(id, vendorId, note) { return this.api('POST', `/recalls/${id}/vendors/${vendorId}/acknowledge`, { note }) },
+    recallVendorRefund(id, vendorId, qty, note) { return this.api('POST', `/recalls/${id}/vendors/${vendorId}/refund`, { qty, note }) },
+    recallVendorNone(id, vendorId, note) { return this.api('POST', `/recalls/${id}/vendors/${vendorId}/none`, { note }) },
+    recallReturnBatches(id, qty) { return this.api('POST', `/recalls/${id}/return`, { qty }) },
+    recallDestroyBatches(id, qty, note) { return this.api('POST', `/recalls/${id}/destroy`, { qty, note }) },
+    async recallCompensationQuote(id) { return j('GET', `/recalls/${id}/compensation`) },
+    recallPayCompensation(id, amount, note) { return this.api('POST', `/recalls/${id}/compensation`, { amount, note }) },
+    closeRecall(id, note) { return this.api('POST', `/recalls/${id}/close`, { note }) },
+    closeFalseRecall(id, reason) { return this.api('POST', `/recalls/${id}/false`, { reason }) },
+    cancelRecall(id, reason) { return this.api('POST', `/recalls/${id}/cancel`, { reason }) },
+    async recallDetail(id) { return j('GET', `/recalls/${id}`) }
   }
 })
